@@ -107,11 +107,3 @@ The application can be configured through the following constants in `demo_v2.1.
 3. Commit your changes
 4. Push to the branch
 5. Create a Pull Request
-
-## License
-
-[Specify your license here]
-
-## Support
-
-For support, please [specify contact information or support channels]
