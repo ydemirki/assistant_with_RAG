@@ -1,4 +1,4 @@
-# NetPak AI Assistant
+# AI Assistant
 
 A sophisticated document-based AI assistant built with Streamlit, designed for corporate document management and intelligent conversation.
 
