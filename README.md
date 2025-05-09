@@ -34,8 +34,8 @@ NetPak AI Assistant is an advanced document management and conversational AI sys
 
 1. Clone the repository:
 ```bash
-git clone [repository-url]
-cd [repository-name]
+git clone https://github.com/ydemirki/assistant_with_RAG.git
+cd assistant_with_RAG
 ```
 
 2. Install required packages:
