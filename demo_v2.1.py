@@ -13,13 +13,21 @@ from langchain_core.documents import Document
 from datetime import datetime
 from document_processor import DocumentProcessor, SUPPORTED_EXTENSIONS
 from document_manager import CorporateDocumentManager
+from reasoning_chain import MultiHopReasoningChain
 import pandas as pd
 from pyngrok import ngrok
+from langchain_community.document_loaders import DirectoryLoader, Docx2txtLoader
+from langchain.chat_models import ChatOpenAI
+from langchain_core.output_parsers import StrOutputParser
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('app.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
@@ -28,8 +36,8 @@ DATA_DIR = "./data"
 METADATA_DIR = "./metadata"
 VECTOR_STORE_DIR = "./vector_store"
 MAX_RETRIES = 3
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 100
+CHUNK_SIZE = 200
+CHUNK_OVERLAP = 50
 MAX_TOKEN_LIMIT = 3000
 STREAMLIT_PORT = 8501  # Streamlit'in varsayılan portu
 
@@ -42,242 +50,254 @@ os.makedirs(METADATA_DIR, exist_ok=True)
 os.makedirs(VECTOR_STORE_DIR, exist_ok=True)
 
 class EnhancedConversationMemory:
-    """Enhanced conversation memory with vector store integration"""
+    """Gelişmiş konuşma hafızası yönetimi"""
     
-    def __init__(self, max_token_limit: int = MAX_TOKEN_LIMIT):
-        self.messages: List[Dict[str, Any]] = []
-        self.max_token_limit = max_token_limit
-        self.token_count = 0
-        self.vector_store = Chroma(
-            persist_directory=os.path.join(VECTOR_STORE_DIR, "conversation_memory"),
-            embedding_function=OpenAIEmbeddings()
-        )
-        self._initialize_memory()
-    
-    def _initialize_memory(self):
-        """Initialize memory with improved system message"""
-        system_message = {
-            "role": "system",
-            "content": """You are a professional AI assistant for a packaging company. 
-            You provide accurate, helpful, and business-focused responses.
-            Always maintain context from previous messages and use it to provide more relevant answers.
-            If you're unsure about something, ask for clarification rather than making assumptions.""",
-            "tokens": len("You are a professional AI assistant for a packaging company.") / 4
-        }
-        self.add_message(system_message["role"], system_message["content"])
-    
-    def add_message(self, role: str, content: str) -> None:
-        """Add a message with vector store integration"""
-        try:
-            estimated_tokens = len(content) / 4
-            message = {"role": role, "content": content, "tokens": estimated_tokens}
+    def __init__(self, max_messages: int = 20):
+        self.max_messages = max_messages
+        self.messages = []
+        self.vector_store = None
+        self.embeddings = OpenAIEmbeddings()
+        self.token_count = 0  # Token sayacı eklendi
+        
+    def add_message(self, role: str, content: str):
+        """Yeni mesaj ekle ve vektör deposunu güncelle"""
+        self.messages.append({"role": role, "content": content})
+        
+        # Maksimum mesaj sayısını kontrol et
+        if len(self.messages) > self.max_messages:
+            self.messages = self.messages[-self.max_messages:]
+        
+        # Vektör deposunu güncelle
+        if role == "assistant":
+            self._update_vector_store(content)
             
-            # Vektör veritabanına kaydet
-            doc = Document(
-                page_content=content,
-                metadata={
-                    "role": role,
-                    "timestamp": datetime.now().isoformat(),
-                    "tokens": estimated_tokens
-                }
+        # Token sayısını güncelle (yaklaşık olarak)
+        self.token_count += len(content.split()) // 0.75  # Yaklaşık token sayısı
+    
+    def _update_vector_store(self, content: str):
+        """Vektör deposunu güncelle"""
+        try:
+            # Yeni mesajı vektör deposuna ekle
+            if self.vector_store is None:
+                self.vector_store = Chroma(
+                    collection_name="conversation_history",
+                    embedding_function=self.embeddings
+                )
+            
+            # Mesajı Netpak bağlamında işle
+            metadata = {
+                "role": "assistant",
+                "timestamp": datetime.now().isoformat(),
+                "source": "conversation",
+                "company": "Netpak"
+            }
+            
+            self.vector_store.add_texts(
+                texts=[content],
+                metadatas=[metadata]
             )
-            self.vector_store.add_documents([doc])
             
-            if self.token_count + estimated_tokens > self.max_token_limit:
-                self._prune_old_messages(estimated_tokens)
-            
-            self.messages.append(message)
-            self.token_count += estimated_tokens
-            logger.debug(f"Added message. Current token count: {self.token_count}")
         except Exception as e:
-            logger.error(f"Error adding message to memory: {str(e)}")
+            logging.error(f"Vektör deposu güncelleme hatası: {str(e)}")
     
-    def _prune_old_messages(self, required_tokens: float) -> None:
-        """Prune old messages while maintaining essential context"""
-        while self.token_count + required_tokens > self.max_token_limit and len(self.messages) > 2:
-            if len(self.messages) > 2:
-                removed = self.messages.pop(1)
-                self.token_count -= removed["tokens"]
-                logger.debug(f"Pruned message. New token count: {self.token_count}")
-    
-    def get_relevant_messages(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
-        """Get most relevant messages based on similarity search"""
+    def get_relevant_messages(self, query: str, k: int = 5) -> List[Dict[str, str]]:
+        """Sorgu ile ilgili mesajları getir"""
         try:
-            # Benzer mesajları ara
-            docs = self.vector_store.similarity_search(query, k=k)
-            relevant_messages = []
+            if self.vector_store is None:
+                return []
             
-            for doc in docs:
-                message = {
-                    "role": doc.metadata["role"],
-                    "content": doc.page_content,
-                    "tokens": doc.metadata["tokens"]
-                }
-                relevant_messages.append(message)
+            # Netpak bağlamında benzer mesajları ara
+            results = self.vector_store.similarity_search(
+                query,
+                k=k,
+                filter={"company": "Netpak"}
+            )
             
-            return relevant_messages
+            return [{"role": "assistant", "content": doc.page_content} for doc in results]
+            
         except Exception as e:
-            logger.error(f"Error getting relevant messages: {str(e)}")
+            logging.error(f"İlgili mesajları getirme hatası: {str(e)}")
             return []
     
     def get_chat_history(self) -> List[Dict[str, str]]:
-        """Get chat history with improved context management"""
-        return [{"role": msg["role"], "content": msg["content"]} for msg in self.messages[1:]]
-    
-    def get_recent_messages(self, n: int = 3) -> List[Dict[str, Any]]:
-        """Get most recent messages with context"""
-        return self.messages[-n:] if len(self.messages) >= n else self.messages
+        """Konuşma geçmişini getir"""
+        return [{"role": msg["role"], "content": msg["content"]} for msg in self.messages]
     
     def get_streamlit_messages(self) -> List[Dict[str, str]]:
-        """Get messages in Streamlit format"""
-        return [{"role": msg["role"], "content": msg["content"]} for msg in self.messages]
+        """Streamlit için mesajları getir"""
+        return self.get_chat_history()
+    
+    def clear(self):
+        """Hafızayı temizle"""
+        self.messages = []
+        self.token_count = 0  # Token sayacını sıfırla
+        if self.vector_store:
+            self.vector_store.delete_collection()
+            
+    def get_statistics(self) -> Dict[str, Any]:
+        """Hafıza istatistiklerini getir"""
+        return {
+            "Total Messages": len(self.messages),
+            "Current Token Count": int(self.token_count),
+            "Memory Location": os.path.join(VECTOR_STORE_DIR, "conversation_memory")
+        }
 
-def create_advanced_rag_chain(document_manager: CorporateDocumentManager) -> Any:
-    """Create an advanced RAG chain with improved reasoning and performance"""
+def verify_netpak_documents(documents: List[Document]) -> bool:
+    """Dokümanların Netpak'a ait olup olmadığını doğrula"""
     try:
-        def detect_language(text: str) -> str:
-            """Detect language of the input text"""
-            # Türkçe karakterleri kontrol et
-            tr_chars = set('çğıöşüÇĞİÖŞÜ')
-            en_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ')
+        # Netpak'a özgü anahtar kelimeler
+        netpak_keywords = [
+            "Netpak",
+            "POL-01",  # Politika dokümanlarının numaralandırma formatı
+            "Sosyal Uygunluk Politikası",
+            "İş Sağlığı ve Güvenliği Politikası",
+            "Çevre Politikası"
+        ]
+        
+        # Her dokümanı kontrol et
+        for doc in documents:
+            content = doc.page_content.lower()
+            metadata = doc.metadata
             
-            tr_count = sum(1 for c in text if c in tr_chars)
-            en_count = sum(1 for c in text if c in en_chars)
+            # Dosya adından kontrol
+            if "source" in metadata:
+                source = metadata["source"].lower()
+                if any(keyword.lower() in source for keyword in netpak_keywords):
+                    continue
             
-            return 'tr' if tr_count > en_count else 'en'
+            # İçerikten kontrol
+            if any(keyword.lower() in content for keyword in netpak_keywords):
+                continue
+            
+            # Eğer doküman Netpak'a ait değilse
+            logging.warning(f"Non-Netpak document detected: {metadata.get('source', 'unknown')}")
+            return False
         
-        def get_system_prompt(lang: str) -> str:
-            """Get system prompt based on detected language"""
-            if lang == 'tr':
-                return """Profesyonel bir yapay zeka asistanısınız. 
-                Göreviniz, verilen bağlamı kullanarak doğru ve yardımcı yanıtlar vermektir.
-                Şu kurallara uyun:
-                1. Sadece bağlamda verilen bilgileri kullanın
-                2. Bağlam yeterli bilgi içermiyorsa, bunu açıkça belirtin
-                3. Doküman analizinde, önemli bilgilere odaklanın
-                4. Profesyonel ve net bir iletişim tarzı kullanın
-                5. Emin olmadığınız bir konuda, varsayımda bulunmak yerine açıklama isteyin
-                6. Mümkün olduğunda bağlamdan spesifik örnekler verin
-                7. Her zaman en alakalı bilgileri önceliklendirin
-                8. Bağlamdaki bilgileri mantıksal bir sırayla sunun"""
-            else:
-                return """You are a professional AI assistant. 
-                Your task is to provide accurate and helpful responses based on the provided context.
-                Follow these guidelines:
-                1. Use only the information provided in the context
-                2. If the context doesn't contain enough information, say so clearly
-                3. For document analysis, focus on extracting key information
-                4. Maintain a professional and clear communication style
-                5. If you're unsure about something, ask for clarification
-                6. Provide specific examples from the context when possible
-                7. Always prioritize the most relevant information
-                8. Present information in a logical sequence"""
+        return True
         
-        def get_user_prompt(context: str, question: str, lang: str) -> str:
-            """Get user prompt based on detected language"""
-            if lang == 'tr':
-                return f"""Bağlam: {context}
+    except Exception as e:
+        logging.error(f"Error verifying Netpak documents: {str(e)}")
+        return False
 
-Soru: {question}
-
-Lütfen yukarıdaki bağlama dayanarak detaylı ve doğru bir yanıt verin.
-Önemli noktalar:
-1. Sadece soruyla doğrudan ilgili bilgileri kullanın
-2. En alakalı bilgileri önceliklendirin
-3. Bilgileri mantıksal bir sırayla sunun
-4. Bağlam yeterli değilse, hangi ek bilgilerin gerekli olduğunu belirtin
-5. Doküman analizinde, en önemli noktalara odaklanın"""
-            else:
-                return f"""Context: {context}
-
-Question: {question}
-
-Please provide a detailed and accurate response based on the context above.
-Key points:
-1. Use only information directly relevant to the question
-2. Prioritize the most relevant information
-3. Present information in a logical sequence
-4. If context is insufficient, specify what additional information is needed
-5. In document analysis, focus on the most important points"""
+def create_advanced_rag_chain():
+    """Gelişmiş RAG zinciri oluştur"""
+    try:
+        # Model ve tokenizer'ı yükle
+        model = ChatOpenAI(
+            model_name="gpt-4-turbo-preview",
+            temperature=0.1,
+            max_tokens=4000
+        )
         
-        def process_with_advanced_reasoning(inputs: Dict[str, Any]) -> str:
-            """Process user input with advanced reasoning and improved context handling"""
+        # Doküman yükleme ve işleme
+        loader = DirectoryLoader(
+            DATA_DIR,
+            glob="**/*.docx",
+            loader_cls=Docx2txtLoader
+        )
+        documents = loader.load()
+        
+        # Dokümanları işle
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=200,
+            chunk_overlap=50,
+            separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
+        )
+        splits = text_splitter.split_documents(documents)
+        
+        # Her chunk'a Netpak metadata'sı ekle
+        for split in splits:
+            split.metadata.update({
+                "company": "Netpak",
+                "document_type": "policy" if "POL-01" in str(split.metadata.get("source", "")) else "data"
+            })
+        
+        # Embedding modeli
+        embeddings = OpenAIEmbeddings()
+        
+        # Vector store oluştur
+        vectorstore = Chroma.from_documents(
+            documents=splits,
+            embedding=embeddings,
+            persist_directory=VECTOR_STORE_DIR
+        )
+        
+        # Retriever'ı yapılandır
+        retriever = vectorstore.as_retriever(
+            search_type="similarity",
+            search_kwargs={
+                "k": 2,
+                "filter": {"company": "Netpak"}
+            }
+        )
+        
+        # Multi-hop reasoning chain oluştur
+        reasoning_chain = MultiHopReasoningChain(
+            model=model,
+            retriever=retriever
+        )
+        
+        # Dil tespiti için prompt
+        language_detection_prompt = ChatPromptTemplate.from_messages([
+            ("system", """Soru hangi dilde sorulmuş, tespit et.
+            Sadece 'tr' veya 'en' olarak cevap ver.
+            
+            ÖNEMLİ: Sadece dil tespiti yap, başka bir işlem yapma."""),
+            ("human", "{question}")
+        ])
+        
+        # Dil tespiti zinciri
+        language_detection_chain = language_detection_prompt | model | StrOutputParser()
+        
+        # Ana zincir
+        def process_question(question: str, chat_history: List[Dict[str, str]] = None) -> str:
             try:
-                question = inputs["question"]
-                chat_history = inputs.get("chat_history", [])
-
-                # Detect language
-                detected_lang = detect_language(question)
-
-                # Retrieve context with improved relevance
-                retrieved_docs = document_manager.search_documents(question, k=8)
+                # Dil tespiti yap
+                language = language_detection_chain.invoke({"question": question})
+                st.write("🔍 Dil tespiti:", language)
                 
-                # Get relevant conversation history
-                relevant_messages = st.session_state.memory.get_relevant_messages(question, k=5)
+                # Konuşma geçmişini sınırla (son 3 mesaj gibi)
+                limited_chat_history = (chat_history or [])[-3:]
+                st.write("💬 Kullanılan konuşma geçmişi:", len(limited_chat_history), "mesaj")
                 
-                if not retrieved_docs and not relevant_messages:
-                    if detected_lang == 'tr':
-                        return "Dokümanlarda veya konuşma geçmişinde sorunuzu yanıtlamak için yeterli bilgi bulamadım. Lütfen sorunuzu yeniden ifade edin veya daha ilgili dokümanlar yükleyin."
-                    else:
-                        return "I couldn't find any relevant information in the documents or conversation history to answer your question. Please try rephrasing your question or upload more relevant documents."
+                # Soruyu işle
+                st.write("🤔 Soru işleniyor...")
+                response = reasoning_chain.invoke(
+                    question=question,
+                    chat_history=limited_chat_history
+                )
                 
-                # Format context
-                context = format_docs(retrieved_docs)
-                
-                # Add conversation history
-                if relevant_messages:
-                    conversation_context = "\n\nRelevant conversation history:\n"
-                    for msg in relevant_messages:
-                        conversation_context += f"{msg['role']}: {msg['content']}\n"
-                    context += conversation_context
-
-                # Prepare messages with improved prompting
-                messages = [
-                    {"role": "system", "content": get_system_prompt(detected_lang)},
-                    *chat_history,
-                    {"role": "user", "content": get_user_prompt(context, question, detected_lang)}
-                ]
-
-                try:
-                    # Get response from OpenAI with improved parameters
-                    response = client.chat.completions.create(
-                        model="gpt-3.5-turbo",
-                        messages=messages,
-                        temperature=0.15,  # Daha tutarlı yanıtlar için düşük sıcaklık
-                        max_tokens=1500,  # Daha detaylı yanıtlar için token sayısını artır
-                        presence_penalty=0.6,
-                        frequency_penalty=0.3,
-                        top_p=0.95,
-                        stop=None
-                    )
+                # Log dosyasından son bilgileri oku ve göster
+                with open('app.log', 'r', encoding='utf-8') as f:
+                    logs = f.readlines()
+                    last_logs = logs[-20:]  # Son 20 log satırını al
                     
-                    if not response.choices:
-                        if detected_lang == 'tr':
-                            return "Üzgünüm, bir yanıt oluşturamadım. Lütfen tekrar deneyin."
-                        else:
-                            return "I apologize, but I couldn't generate a response. Please try again."
-                    
-                    return response.choices[0].message.content
-
-                except Exception as e:
-                    logger.error(f"OpenAI API error: {str(e)}")
-                    if detected_lang == 'tr':
-                        return "Üzgünüm, isteğinizi işlerken bir hata oluştu. Lütfen biraz sonra tekrar deneyin."
-                    else:
-                        return "I apologize, but I encountered an error while processing your request. Please try again in a moment."
-
+                    st.write("📊 Model İstatistikleri:")
+                    for log in last_logs:
+                        if "Retrieved context length" in log:
+                            st.write("📚 Alınan bağlam uzunluğu:", log.split(" - ")[-1].strip())
+                        elif "Created subquestions" in log:
+                            st.write("❓ Oluşturulan alt sorular:", log.split(" - ")[-1].strip())
+                        elif "Context length" in log:
+                            st.write("📝 Alt soru bağlam uzunluğu:", log.split(" - ")[-1].strip())
+                        elif "Formatted answers length" in log:
+                            st.write("📋 Birleştirilen cevaplar uzunluğu:", log.split(" - ")[-1].strip())
+                        elif "Full context being sent to model" in log:
+                            st.write("📤 Modele gönderilen tam bağlam:", log.split(" - ")[-1].strip())
+                        elif "Full formatted answers being sent to model" in log:
+                            st.write("📤 Modele gönderilen tam cevaplar:", log.split(" - ")[-1].strip())
+                
+                return response
+                
             except Exception as e:
-                logger.error(f"Error in RAG processing: {str(e)}")
-                if detected_lang == 'tr':
-                    return "Üzgünüm, isteğinizi işlerken bir hata oluştu. Lütfen tekrar deneyin veya sorunuzu yeniden ifade edin."
-                else:
-                    return "I apologize, but I encountered an error processing your request. Please try again or rephrase your question."
-
-        return process_with_advanced_reasoning
+                logging.error(f"Soru işleme hatası: {str(e)}")
+                return "Üzgünüm, Netpak'ın dokümanlarından yanıt oluştururken bir hata oluştu. Lütfen tekrar deneyin."
+        
+        return process_question
 
     except Exception as e:
-        logger.error(f"Error creating RAG chain: {str(e)}")
-        return None
+        logging.error(f"RAG zinciri oluşturma hatası: {str(e)}")
+        raise
 
 def format_docs(docs):
     """Format documents with improved structure and error handling"""
@@ -599,12 +619,9 @@ def streamlit_app():
                     message_placeholder = st.empty()
                     with st.spinner("🤔 Thinking..."):
                         try:
-                            rag_chain = create_advanced_rag_chain(st.session_state.document_manager)
+                            rag_chain = create_advanced_rag_chain()
                             if rag_chain:
-                                response = rag_chain({
-                                    "question": user_prompt,
-                                    "chat_history": st.session_state.memory.get_chat_history()
-                                })
+                                response = rag_chain(user_prompt)
                                 message_placeholder.markdown(response)
                                 st.session_state.memory.add_message("assistant", response)
                             else:
@@ -624,11 +641,7 @@ def streamlit_app():
                     st.json(vector_stats)
                     
                     # Display conversation memory statistics
-                    memory_stats = {
-                        "Total Messages": len(st.session_state.memory.messages),
-                        "Current Token Count": st.session_state.memory.token_count,
-                        "Memory Location": os.path.join(VECTOR_STORE_DIR, "conversation_memory")
-                    }
+                    memory_stats = st.session_state.memory.get_statistics()
                     st.markdown("### 💬 Conversation Memory")
                     st.json(memory_stats)
                 except Exception as e:

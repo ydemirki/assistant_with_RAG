@@ -14,3 +14,6 @@ PyYAML>=6.0.1
 chromadb>=0.4.22
 unstructured>=0.11.0
 pyngrok
+tiktoken>=0.5.2
+numpy>=1.24.0
+scikit-learn>=1.3.0
